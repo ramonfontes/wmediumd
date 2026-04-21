@@ -187,7 +187,7 @@ struct wmediumd {
 	int per_matrix_signal_min;
 	int fading_coefficient;
 	int noise_threshold;
-    struct nakagami_model_param *nakagami_param;
+	struct nakagami_model_param *nakagami_param;
 
 	struct nl_cb *cb;
 	int family_id;

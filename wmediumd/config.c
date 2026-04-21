@@ -30,33 +30,6 @@
 
 #include "wmediumd.h"
 
-static double _gamma_sample(double shape, double scale) {
-    if (shape < 1.0) 
-        return _gamma_sample(shape + 1.0, scale) * pow(drand48(), 1.0 / shape);
-
-    double d = shape - 1.0 / 3.0;
-    double c = 1.0 / sqrt(9.0 * d);
-    double x, v, u;
-
-    while (1) {
-        do {
-            x = cos(2 * M_PI * drand48()) * sqrt(-2 * log(drand48()));
-            v = 1.0 + c * x;
-        } while (v <= 0);
-
-        v = v * v * v;
-        u = drand48();
-        if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v * scale;
-        if (log(u) < 0.5 * x * x + d * (1.0 - v + log(v))) return d * v * scale;
-    }
-}
-
-static double get_nakagami_gain_db(double m) {
-    if (m <= 0.0) return 0.0;
-    double gain_linear = _gamma_sample(m, 1.0 / m);
-    return 10.0 * log10(gain_linear); // Convert power gain to Decibels
-}
-
 static void string_to_mac_address(const char *str, u8 *addr)
 {
 	int a[ETH_ALEN];
@@ -111,6 +84,37 @@ int use_fixed_random_value(struct wmediumd *ctx)
 
 #define FREQ_1CH (2.412e9)		// [Hz]
 #define SPEED_LIGHT (2.99792458e8)	// [meter/sec]
+
+static double _gamma_sample(double shape, double scale) {
+    if (shape < 1.0)
+        return _gamma_sample(shape + 1.0, scale) * pow(drand48(), 1.0 / shape);
+
+    double d = shape - 1.0 / 3.0;
+    double c = 1.0 / sqrt(9.0 * d);
+    double x, v, u, r;
+
+    while (1) {
+        do {
+            r = drand48();
+            if (r == 0.0) r = 1e-10;
+            x = cos(2 * M_PI * drand48()) * sqrt(-2 * log(r));
+            v = 1.0 + c * x;
+        } while (v <= 0);
+
+        v = v * v * v;
+        u = drand48();
+        if (u == 0.0) u = 1e-10;
+        if (u < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v * scale;
+        if (log(u) < 0.5 * x * x + d * (1.0 - v + log(v))) return d * v * scale;
+    }
+}
+
+static double get_nakagami_gain_db(double m) {
+    if (m <= 0.0) return 0.0;
+    double gain_linear = _gamma_sample(m, 1.0 / m);
+    if (gain_linear <= 0.0) gain_linear = 1e-10;
+    return 10.0 * log10(gain_linear);
+}
 /*
  * Calculate path loss based on a free-space path loss
  *
@@ -324,18 +328,17 @@ static void recalc_path_loss(struct wmediumd *ctx)
 			txpower = ctx->sta_array[start]->tx_power;
 			if (ctx->sta_array[end]->isap == 1)
 				txpower = ctx->sta_array[end]->tx_power;
-
 			path_loss = ctx->calc_path_loss(ctx->path_loss_param,
-				ctx->sta_array[end], ctx->sta_array[start]);
-			gains = txpower + ctx->sta_array[start]->gain + ctx->sta_array[end]->gain;
-			signal = gains - path_loss - ctx->noise_threshold;
-			if (ctx->nakagami_param) {
-			    double gain = get_nakagami_gain_db(ctx->nakagami_param->m);
-    			signal += (int)gain;
-			}
+                ctx->sta_array[end], ctx->sta_array[start]);
+            gains = txpower + ctx->sta_array[start]->gain + ctx->sta_array[end]->gain;
+            signal = gains - path_loss - ctx->noise_threshold;
+            if (ctx->nakagami_param != NULL) {
+                double gain = get_nakagami_gain_db(ctx->nakagami_param->m);
+                signal += (int)gain;
+            }
             ctx->snr_matrix[ctx->num_stas * start + end] = signal;
             ctx->snr_matrix[ctx->num_stas * end + start] = signal;
-	}
+		}
     }
 }
 
@@ -411,10 +414,13 @@ static int parse_path_loss(struct wmediumd *ctx, config_t *cf)
 	if (config_setting_lookup_string(model, "model_name",
 		&path_loss_model_name) != CONFIG_TRUE) {
 		w_flogf(ctx, LOG_ERR, stderr, "Specify model_name\n");
-		return -EINVAL;
-	}
-	if (strncmp(path_loss_model_name, "log_distance",
-		    sizeof("log_distance")) == 0) {
+        return -EINVAL;
+    }
+    
+    ctx->nakagami_param = NULL; // Initialization to NULL to avoid segfault
+    
+    if (strncmp(path_loss_model_name, "log_distance",
+            sizeof("log_distance")) == 0) {
 		struct log_distance_model_param *param;
 		ctx->calc_path_loss = calc_path_loss_log_distance;
 		param = malloc(sizeof(*param));
@@ -527,20 +533,23 @@ static int parse_path_loss(struct wmediumd *ctx, config_t *cf)
 		}
 
 		if (config_setting_lookup_int(model, "pL",
-			&param->pL) != CONFIG_TRUE) {
-			w_flogf(ctx, LOG_ERR, stderr, "PL not found\n");
-			return -EINVAL;
-		}
-		ctx->path_loss_param = param;
-	}
-	else if (strncmp(path_loss_model_name, "nakagami", sizeof("nakagami")) == 0) {
+            &param->pL) != CONFIG_TRUE) {
+            w_flogf(ctx, LOG_ERR, stderr, "PL not found\n");
+            return -EINVAL;
+        }
+        ctx->path_loss_param = param;
+    }
+    else if (strncmp(path_loss_model_name, "nakagami", sizeof("nakagami")) == 0) {
         struct nakagami_model_param *param;
+        struct log_distance_model_param *ld_param;
         
-        // Reusing Log-Distance function (calc_path_loss_log_distance) as the base path loss for Nakagami
         ctx->calc_path_loss = calc_path_loss_log_distance; 
         
         param = malloc(sizeof(*param));
-        if (!param) return -EINVAL;
+        if (!param) {
+            w_flogf(ctx, LOG_ERR, stderr, "Out of memory(nakagami_param)\n");
+            return -ENOMEM;
+        }
 
         if (config_setting_lookup_float(model, "m", &param->m) != CONFIG_TRUE) {
             w_flogf(ctx, LOG_ERR, stderr, "Nakagami m parameter not found, defaulting to 1.0\n");
@@ -548,16 +557,25 @@ static int parse_path_loss(struct wmediumd *ctx, config_t *cf)
         }
         ctx->nakagami_param = param;
         
-        // Nakagami uses standard log_distance parameters (log_distance_model_param) for the 'Omega' (average power)
-        struct log_distance_model_param *ld_param = malloc(sizeof(*ld_param));
+        ld_param = malloc(sizeof(*ld_param));
+        if (!ld_param) {
+            free(param); 
+            ctx->nakagami_param = NULL;
+            w_flogf(ctx, LOG_ERR, stderr, "Out of memory(path_loss_param)\n");
+            return -ENOMEM;
+        }
+
+        ld_param->path_loss_exponent = 2.0; 
+        ld_param->Xg = 0.0;
+
         config_setting_lookup_float(model, "path_loss_exp", &ld_param->path_loss_exponent);
         config_setting_lookup_float(model, "xg", &ld_param->Xg);
         ctx->path_loss_param = ld_param;
     }
-	else {
-		w_flogf(ctx, LOG_ERR, stderr, "No path loss model found\n");
-		return -EINVAL;
-	}
+    else {
+        w_flogf(ctx, LOG_ERR, stderr, "No path loss model found\n");
+        return -EINVAL;
+    }
 
 	list_for_each_entry(station, &ctx->stations, list) {
 		position = config_setting_get_elem(positions, station->index);
@@ -929,6 +947,8 @@ int load_config(struct wmediumd *ctx, const char *file, const char *per_file, bo
 fail:
 	free(ctx->snr_matrix);
 	free(ctx->error_prob_matrix);
+	free(ctx->nakagami_param);
+	ctx->nakagami_param = NULL;
 	config_destroy(cf);
 	return -EINVAL;
 }

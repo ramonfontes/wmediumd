@@ -25,6 +25,8 @@
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
 #include <netlink/genl/family.h>
+#include <linux/nl80211.h>
+#include <sys/utsname.h>
 #include <stdint.h>
 #include <getopt.h>
 #include <signal.h>
@@ -303,6 +305,157 @@ static struct station *get_station_by_addr(struct wmediumd *ctx, u8 *addr)
 			return station;
 	}
 	return NULL;
+}
+
+/*
+ * hwsim forwards PMSR requests to the registered medium only on kernels
+ * >= 6.4. Gate the handler on the running kernel so older hosts are
+ * unaffected. The result is probed once and cached.
+ */
+static bool kernel_supports_pmsr(void)
+{
+	static int supported = -1;
+	struct utsname uts;
+	int major = 0, minor = 0;
+
+	if (supported < 0) {
+		supported = (uname(&uts) == 0 &&
+			     sscanf(uts.release, "%d.%d", &major, &minor) == 2 &&
+			     (major > 6 || (major == 6 && minor >= 4)));
+	}
+	return supported;
+}
+
+/* PMSR requests carry the initiator radio's permanent (hw) address. */
+static struct station *get_station_by_hwaddr(struct wmediumd *ctx, u8 *hwaddr)
+{
+	struct station *station;
+
+	list_for_each_entry(station, &ctx->stations, list) {
+		if (memcmp(station->hwaddr, hwaddr, ETH_ALEN) == 0)
+			return station;
+	}
+	return NULL;
+}
+
+static double sta_distance(struct station *a, struct station *b)
+{
+	double dx = a->x - b->x;
+	double dy = a->y - b->y;
+	double dz = a->z - b->z;
+
+	return sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/*
+ * Answer an FTM peer-measurement (PMSR) request from station geometry.
+ *
+ * The kernel sends HWSIM_CMD_START_PMSR with the initiator radio in
+ * HWSIM_ATTR_ADDR_TRANSMITTER and an nl80211 PMSR request nested in
+ * HWSIM_ATTR_PMSR_REQUEST. For each requested peer we compute the true
+ * distance from the medium's station table, convert it to a round-trip
+ * time, and return it in a HWSIM_CMD_REPORT_PMSR message carrying an
+ * nl80211 FTM result. Secure ranging (secure LTF) is modelled by
+ * reporting the geometric distance: an initiator cannot make a peer
+ * appear closer than it truly is.
+ *
+ * The nested nl80211 TLV encoding follows the kernel PMSR layout; the
+ * exact framing must be validated against a live >= 6.4 kernel with
+ * PMSR-capable radios.
+ */
+static void hwsim_handle_pmsr_request(struct wmediumd *ctx,
+				      struct nlmsghdr *nlh)
+{
+	struct nlattr *attrs[HWSIM_ATTR_MAX + 1];
+	struct nlattr *pmsr_req, *peer, *result, *result_peers;
+	struct station *req_sta;
+	struct nl_msg *msg;
+	u8 *transmitter;
+	int rem, idx = 0;
+
+	if (genlmsg_parse(nlh, 0, attrs, HWSIM_ATTR_MAX, NULL) < 0)
+		return;
+	if (!attrs[HWSIM_ATTR_ADDR_TRANSMITTER] ||
+	    !attrs[HWSIM_ATTR_PMSR_REQUEST])
+		return;
+
+	transmitter = (u8 *)nla_data(attrs[HWSIM_ATTR_ADDR_TRANSMITTER]);
+	req_sta = get_station_by_hwaddr(ctx, transmitter);
+	if (!req_sta)
+		return;
+
+	/*
+	 * HWSIM_ATTR_PMSR_REQUEST wraps an NL80211_ATTR_PEER_MEASUREMENTS
+	 * container that holds one NL80211_PMSR_ATTR_PEERS attribute per peer.
+	 */
+	pmsr_req = nla_find(nla_data(attrs[HWSIM_ATTR_PMSR_REQUEST]),
+			    nla_len(attrs[HWSIM_ATTR_PMSR_REQUEST]),
+			    NL80211_ATTR_PEER_MEASUREMENTS);
+	if (!pmsr_req)
+		return;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return;
+
+	if (genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, ctx->family_id, 0,
+			NLM_F_REQUEST, HWSIM_CMD_REPORT_PMSR, VERSION_NR) == NULL)
+		goto out;
+
+	nla_put(msg, HWSIM_ATTR_ADDR_TRANSMITTER, ETH_ALEN, transmitter);
+
+	result = nla_nest_start(msg, HWSIM_ATTR_PMSR_RESULT);
+	result_peers = nla_nest_start(msg, NL80211_PMSR_ATTR_PEERS);
+
+	nla_for_each_nested(peer, pmsr_req, rem) {
+		struct nlattr *pa[NL80211_PMSR_PEER_ATTR_MAX + 1];
+		struct nlattr *rpeer, *resp, *data, *ftm;
+		struct station *peer_sta;
+		u8 *peer_addr;
+		double dist;
+		int64_t rtt_ps;
+
+		if (nla_type(peer) != NL80211_PMSR_ATTR_PEERS)
+			continue;
+		if (nla_parse_nested(pa, NL80211_PMSR_PEER_ATTR_MAX, peer,
+				     NULL) < 0)
+			continue;
+		if (!pa[NL80211_PMSR_PEER_ATTR_ADDR])
+			continue;
+
+		peer_addr = (u8 *)nla_data(pa[NL80211_PMSR_PEER_ATTR_ADDR]);
+		peer_sta = get_station_by_addr(ctx, peer_addr);
+		if (!peer_sta)
+			peer_sta = get_station_by_hwaddr(ctx, peer_addr);
+		if (!peer_sta)
+			continue;
+
+		dist = sta_distance(req_sta, peer_sta);
+		rtt_ps = (int64_t)(2.0 * dist / SPEED_OF_LIGHT_M_PER_S * 1e12);
+
+		rpeer = nla_nest_start(msg, ++idx);
+		nla_put(msg, NL80211_PMSR_PEER_ATTR_ADDR, ETH_ALEN, peer_addr);
+		resp = nla_nest_start(msg, NL80211_PMSR_PEER_ATTR_RESP);
+		nla_put_u32(msg, NL80211_PMSR_RESP_ATTR_STATUS,
+			    NL80211_PMSR_STATUS_SUCCESS);
+		data = nla_nest_start(msg, NL80211_PMSR_RESP_ATTR_DATA);
+		ftm = nla_nest_start(msg, NL80211_PMSR_TYPE_FTM);
+		nla_put_u32(msg, NL80211_PMSR_FTM_RESP_ATTR_NUM_FTMR_ATTEMPTS, 1);
+		nla_put_u32(msg, NL80211_PMSR_FTM_RESP_ATTR_NUM_FTMR_SUCCESSES, 1);
+		nla_put(msg, NL80211_PMSR_FTM_RESP_ATTR_RTT_AVG,
+			sizeof(rtt_ps), &rtt_ps);
+		nla_nest_end(msg, ftm);
+		nla_nest_end(msg, data);
+		nla_nest_end(msg, resp);
+		nla_nest_end(msg, rpeer);
+	}
+
+	nla_nest_end(msg, result_peers);
+	nla_nest_end(msg, result);
+
+	nl_send_auto_complete(ctx->sock, msg);
+out:
+	nlmsg_free(msg);
 }
 
 void detect_mediums(struct wmediumd *ctx, struct station *src, struct station *dest) {
@@ -918,6 +1071,17 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 {
 	struct nlmsghdr *nlh = nlmsg_hdr(msg);
 	struct wmediumd* ctx = (struct wmediumd*)arg;
+	struct genlmsghdr *gnlh = nlmsg_data(nlh);
+
+	/* PMSR (FTM) is answered locally by the medium, regardless of op_mode. */
+	if (kernel_supports_pmsr()) {
+		if (gnlh->cmd == HWSIM_CMD_START_PMSR) {
+			hwsim_handle_pmsr_request(ctx, nlh);
+			return 0;
+		}
+		if (gnlh->cmd == HWSIM_CMD_ABORT_PMSR)
+			return 0;
+	}
 
 	if (ctx->op_mode == LOCAL)
 		return process_recvd_data(ctx, nlh);

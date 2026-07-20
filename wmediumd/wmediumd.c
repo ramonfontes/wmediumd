@@ -1201,6 +1201,25 @@ static void sock_event_cb(int fd, short what, void *data)
 	nl_recvmsgs_default(ctx->sock);
 }
 
+static struct event ev_reregister;
+static struct timeval reregister_iv = { 2, 0 };
+
+/*
+ * Periodically re-assert the hwsim registration. Under Mininet-WiFi the
+ * kernel can drop wmediumd's medium registration mid-setup (it is released
+ * when the position/config client disconnects from the wserver), silently
+ * switching hwsim to the perfect channel and disabling PMSR/FTM. The netlink
+ * socket stays open, so re-sending HWSIM_CMD_REGISTER restores the medium;
+ * the kernel answers -EBUSY while a registration is still in place.
+ */
+static void reregister_cb(int fd, short what, void *data)
+{
+	struct wmediumd *ctx = data;
+
+	send_register_msg(ctx);
+	evtimer_add(&ev_reregister, &reregister_iv);
+}
+
 /*
  * Setup netlink socket and callbacks.
  */
@@ -1479,6 +1498,10 @@ int main(int argc, char *argv[])
 	if (send_register_msg(&ctx) == 0) {
 		w_logf(&ctx, LOG_NOTICE, "REGISTER SENT!\n");
 	}
+
+	/* keep the registration alive across spurious kernel releases */
+	evtimer_set(&ev_reregister, reregister_cb, &ctx);
+	evtimer_add(&ev_reregister, &reregister_iv);
 
 	if (start_server == true)
 		start_wserver(&ctx);

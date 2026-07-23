@@ -348,6 +348,83 @@ static double sta_distance(struct station *a, struct station *b)
 }
 
 /*
+ * Channel bandwidth [Hz] carried by a PMSR peer request (its chandef); 0 if
+ * absent.
+ */
+static double pmsr_chan_bw_hz(struct nlattr *chan_attr)
+{
+	struct nlattr *ch[NL80211_ATTR_MAX + 1];
+
+	if (!chan_attr ||
+	    nla_parse_nested(ch, NL80211_ATTR_MAX, chan_attr, NULL) < 0 ||
+	    !ch[NL80211_ATTR_CHANNEL_WIDTH])
+		return 0.0;
+
+	switch (nla_get_u32(ch[NL80211_ATTR_CHANNEL_WIDTH])) {
+	case NL80211_CHAN_WIDTH_5:	return 5e6;
+	case NL80211_CHAN_WIDTH_10:	return 10e6;
+	case NL80211_CHAN_WIDTH_40:	return 40e6;
+	case NL80211_CHAN_WIDTH_80:
+	case NL80211_CHAN_WIDTH_80P80:	return 80e6;
+	case NL80211_CHAN_WIDTH_160:	return 160e6;
+	default:			return 20e6;
+	}
+}
+
+/*
+ * ToA Cramer-Rao lower bound for the LOS ranging jitter, from the requested
+ * bandwidth and the medium's own SNR:
+ *   sigma = alpha * c / (2*pi * B_rms * sqrt(2*SNR))
+ * Falls back to the fixed pmsr_sigma_m when bandwidth or SNR is unavailable.
+ */
+static double pmsr_crlb_sigma(struct wmediumd *ctx, struct station *a,
+			      struct station *b, struct nlattr **pa)
+{
+	double bw_hz = pmsr_chan_bw_hz(pa[NL80211_PMSR_PEER_ATTR_CHAN]);
+	double b_rms, snr_lin;
+
+	if (bw_hz <= 0.0 || !ctx->get_link_snr)
+		return ctx->pmsr_sigma_m;
+
+	snr_lin = pow(10.0, ctx->get_link_snr(ctx, a, b) / 10.0);
+	if (snr_lin < 1e-3)
+		snr_lin = 1e-3;
+	b_rms = ctx->pmsr_brms_ratio * bw_hz;
+
+	return ctx->pmsr_crlb_alpha * SPEED_OF_LIGHT_M_PER_S /
+	       (2.0 * M_PI * b_rms * sqrt(2.0 * snr_lin));
+}
+
+/*
+ * Two-state (LOS/NLOS) FTM ranging-error model. The clean geometric distance
+ * is perturbed by a zero-mean Gaussian LOS jitter of the given std dev and,
+ * with probability pmsr_nlos_prob, a positive exponential NLOS bias
+ * (reflections only lengthen the path). Private erand48 stream, reproducible.
+ */
+static double pmsr_apply_error(struct wmediumd *ctx, double dist, double sigma)
+{
+	double d = dist;
+
+	if (sigma > 0.0) {
+		double u1 = erand48(ctx->pmsr_xsubi);
+		double u2 = erand48(ctx->pmsr_xsubi);
+
+		if (u1 < 1e-12)
+			u1 = 1e-12;
+		d += sigma * sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+	}
+	if (ctx->pmsr_nlos_prob > 0.0 &&
+	    erand48(ctx->pmsr_xsubi) < ctx->pmsr_nlos_prob) {
+		double u = erand48(ctx->pmsr_xsubi);
+
+		if (u < 1e-12)
+			u = 1e-12;
+		d += -ctx->pmsr_nlos_bias_m * log(u);
+	}
+	return d < 0.0 ? 0.0 : d;
+}
+
+/*
  * Answer an FTM peer-measurement (PMSR) request from station geometry.
  *
  * The kernel sends HWSIM_CMD_START_PMSR with the initiator radio in
@@ -412,7 +489,7 @@ static void hwsim_handle_pmsr_request(struct wmediumd *ctx,
 		struct nlattr *rpeer, *resp, *data, *ftm;
 		struct station *peer_sta;
 		u8 *peer_addr;
-		double dist;
+		double dist, sigma;
 		int64_t rtt_ps;
 
 		if (nla_type(peer) != NL80211_PMSR_ATTR_PEERS)
@@ -430,7 +507,11 @@ static void hwsim_handle_pmsr_request(struct wmediumd *ctx,
 		if (!peer_sta)
 			continue;
 
-		dist = sta_distance(req_sta, peer_sta);
+		sigma = ctx->pmsr_crlb_alpha > 0.0 ?
+			pmsr_crlb_sigma(ctx, req_sta, peer_sta, pa) :
+			ctx->pmsr_sigma_m;
+		dist = pmsr_apply_error(ctx, sta_distance(req_sta, peer_sta),
+					sigma);
 		rtt_ps = (int64_t)(2.0 * dist / SPEED_OF_LIGHT_M_PER_S * 1e12);
 
 		rpeer = nla_nest_start(msg, ++idx);

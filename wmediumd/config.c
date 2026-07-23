@@ -654,6 +654,14 @@ int load_config(struct wmediumd *ctx, const char *file, const char *per_file, bo
 	float default_prob_value = 0.0;
 	bool *link_map = NULL;
 
+	/* PMSR/FTM ranging-error model defaults (off = exact geometry) */
+	ctx->pmsr_sigma_m = ctx->pmsr_nlos_prob = ctx->pmsr_nlos_bias_m = 0.0;
+	ctx->pmsr_crlb_alpha = 0.0;
+	ctx->pmsr_brms_ratio = 0.2887;   /* 1/sqrt(12): RMS bw of a flat spectrum */
+	ctx->pmsr_xsubi[0] = 1;
+	ctx->pmsr_xsubi[1] = 0;
+	ctx->pmsr_xsubi[2] = 0x330e;
+
 	if (full_dynamic) {
 		ctx->sta_array = malloc(0);
 		ctx->num_stas = 0;
@@ -765,6 +773,38 @@ int load_config(struct wmediumd *ctx, const char *file, const char *per_file, bo
 	} else {
 		ctx->get_fading_signal = get_no_fading_signal;
 		ctx->fading_coefficient = 0;
+	}
+
+	/*
+	 * PMSR/FTM two-state (LOS/NLOS) ranging-error model. Set these in the
+	 * model section (e.g. from a MATLAB-derived table per bandwidth and
+	 * environment); absent -> exact geometry.
+	 */
+	{
+		const config_setting_t *s;
+		int pmsr_seed = 1;
+
+		if ((s = config_lookup(cf, "model.pmsr_sigma_m")))
+			ctx->pmsr_sigma_m = config_setting_get_float(s);
+		if ((s = config_lookup(cf, "model.pmsr_nlos_prob")))
+			ctx->pmsr_nlos_prob = config_setting_get_float(s);
+		if ((s = config_lookup(cf, "model.pmsr_nlos_bias_m")))
+			ctx->pmsr_nlos_bias_m = config_setting_get_float(s);
+		if ((s = config_lookup(cf, "model.pmsr_crlb_alpha")))
+			ctx->pmsr_crlb_alpha = config_setting_get_float(s);
+		if ((s = config_lookup(cf, "model.pmsr_brms_ratio")))
+			ctx->pmsr_brms_ratio = config_setting_get_float(s);
+		if ((s = config_lookup(cf, "model.pmsr_seed"))) {
+			pmsr_seed = config_setting_get_int(s);
+			ctx->pmsr_xsubi[0] = (unsigned short)(pmsr_seed & 0xffff);
+			ctx->pmsr_xsubi[1] = (unsigned short)((pmsr_seed >> 16) & 0xffff);
+		}
+		if (ctx->pmsr_sigma_m > 0.0 || ctx->pmsr_nlos_prob > 0.0 ||
+		    ctx->pmsr_crlb_alpha > 0.0)
+			w_logf(ctx, LOG_NOTICE, "PMSR error model: sigma=%.3f m, "
+			       "crlb_alpha=%.2f, P(NLOS)=%.3f, bias=%.3f m, seed=%d\n",
+			       ctx->pmsr_sigma_m, ctx->pmsr_crlb_alpha,
+			       ctx->pmsr_nlos_prob, ctx->pmsr_nlos_bias_m, pmsr_seed);
 	}
 
 	ctx->move_stations = move_stations_donothing;

@@ -221,6 +221,15 @@ struct wmediumd {
 	int (*get_fading_signal)(struct wmediumd *);
 
 	u8 log_lvl;
+
+	/* PMSR/FTM two-state ranging-error model (configured from the
+	 * environment; all zero by default = exact geometry). */
+	double pmsr_sigma_m;		/* fixed LOS jitter std dev [m] (fallback) */
+	double pmsr_nlos_prob;		/* probability a measurement is NLOS */
+	double pmsr_nlos_bias_m;	/* mean of the exponential NLOS bias [m] */
+	double pmsr_crlb_alpha;		/* >0: derive LOS sigma from the ToA CRLB */
+	double pmsr_brms_ratio;		/* RMS-to-signal bandwidth ratio (B_rms/B) */
+	unsigned short pmsr_xsubi[3];	/* private erand48 state */
 };
 
 struct hwsim_tx_rate {
